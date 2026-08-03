@@ -17,6 +17,30 @@
   </p>
 </div>
 
+### Differences from upstream
+
+| Area | What this fork adds |
+|---|---|
+| Old syntax | Multi-tag types, enum tag/retag forms, packed-string pieces |
+| Includes / structs | Legacy `functag` forms, comma-separated `struct` fields (`Plugin` / `Extension`) |
+| Methodmaps | Property setter aliases with empty params (`public set() = Native;`) |
+| Types | `int64` builtin; type-alias typedefs (`typedef Address = int64;`) |
+| Preprocessor | Bare `#include name` / `#tryinclude name`; quoted paths with `\` |
+| Strings | `\%` escape sequences |
+| Functions | Old-style `void:` return tags |
+| Control flow | Legacy `while !expr do stmt`; unparenthesized `do … while !expr` |
+
+### Building a native DLL (Windows)
+
+Used by SpFormatter via TreeSitter.NET:
+
+```powershell
+npx tree-sitter generate
+# then with MSVC (vcvars64):
+cl /c /O2 /I src src\parser.c src\scanner.c
+link /DLL /OUT:tree-sitter-sourcepawn.dll /EXPORT:tree_sitter_sourcepawn parser.obj scanner.obj
+```
+
 ## Install
 
 ```bash
@@ -105,7 +129,8 @@ Next install [nvim-treesitter](https://github.com/nvim-treesitter/nvim-treesitte
 local parser_config = require "nvim-treesitter.parsers".get_parser_configs()
 parser_config.sourcepawn = {
   install_info = {
-    url = "https://github.com/nilshelmig/tree-sitter-sourcepawn",
+    -- upstream: "https://github.com/nilshelmig/tree-sitter-sourcepawn"
+    url = "https://github.com/maxijabase/tree-sitter-sourcepawn",
     files = {"src/parser.c", "src/scanner.c"},
     branch = "main",
     generate_requires_npm = false,
