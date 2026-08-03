@@ -32,7 +32,10 @@
 
 ### Building a native DLL (Windows)
 
-Used by SpFormatter via TreeSitter.NET:
+Used by SpFormatter via TreeSitter.NET. GitHub Releases attach
+`tree-sitter-sourcepawn.dll` (x64) next to the `.wasm` build. The package
+version is **not** embedded in the DLL binary; consumers should pin by release
+tag or commit.
 
 ```powershell
 npx tree-sitter generate
