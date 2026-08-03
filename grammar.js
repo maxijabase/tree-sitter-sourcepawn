@@ -53,7 +53,9 @@ module.exports = grammar({
     [$.parameter_declaration, $.type],
     [$.alias_assignment, $.type],
     [$.alias_assignment, $.old_type],
-    [$._preproc_expression, $._expression]
+    [$._preproc_expression, $._expression],
+    [$.multi_tag, $._preproc_expression, $._expression],
+    [$._preproc_expression, $.multi_tag],
   ],
 
   precedences: ($) => [[$.type, $._expression]],
@@ -102,16 +104,37 @@ module.exports = grammar({
 
     preproc_binary_expression: ($) => binaryExpression($._preproc_expression),
 
+    // Quoted include path. Allows Windows backslashes. Not string_literal,
+    // because spcomp rejects unknown escapes like `\s` in normal strings
+    // but accepts them in #include / #tryinclude paths.
+    preproc_quoted_path: ($) =>
+      token(seq('"', repeat(/[^"\n]/), '"')),
+
     preproc_include: ($) =>
       seq(
         preprocessor("include"),
-        field("path", choice($.string_literal, $.system_lib_string)),
+        field(
+          "path",
+          choice(
+            alias($.preproc_quoted_path, $.string_literal),
+            $.system_lib_string,
+            // Bare `#include sdktools` (valid on SourceMod 1.7+)
+            $.identifier,
+          ),
+        ),
       ),
 
     preproc_tryinclude: ($) =>
       seq(
         preprocessor("tryinclude"),
-        field("path", choice($.string_literal, $.system_lib_string)),
+        field(
+          "path",
+          choice(
+            alias($.preproc_quoted_path, $.string_literal),
+            $.system_lib_string,
+            $.identifier,
+          ),
+        ),
       ),
 
     preproc_macro: ($) =>
@@ -437,9 +460,15 @@ module.exports = grammar({
     enum: ($) =>
       seq(
         "enum",
-        field(
-          "name",
-          optional(seq($.identifier, optional(token.immediate(":")))),
+        // Disjoint shapes avoid a self-conflict between tag and name on `enum Name:`.
+        optional(
+          choice(
+            seq(
+              field("tag", seq($.identifier, token.immediate(":"))),
+              field("name", seq($.identifier, optional(token.immediate(":")))),
+            ),
+            field("name", seq($.identifier, optional(token.immediate(":")))),
+          ),
         ),
         optional(
           seq(
@@ -511,7 +540,14 @@ module.exports = grammar({
         "typedef",
         field("name", $.identifier),
         "=",
-        $.typedef_expression,
+        choice(
+          $.typedef_expression,
+          // Type alias: `typedef Address = int64;`
+          field(
+            "type",
+            seq($.type, repeat(choice($.dimension, $.fixed_dimension))),
+          ),
+        ),
         $._semicolon,
       ),
 
@@ -567,14 +603,16 @@ module.exports = grammar({
 
     functag: ($) =>
       choice(
+        // `functag public Name(...)` and `functag public Return:Name(...)`
         seq(
           "functag",
           "public",
-          field("returnType", $.old_type),
+          field("returnType", optional($.old_type)),
           field("name", $.identifier),
           field("parameters", $.parameter_declarations),
           optional($._semicolon),
         ),
+        // `functag Name public(...)`
         seq(
           "functag",
           field("name", $.identifier),
@@ -582,6 +620,7 @@ module.exports = grammar({
           field("parameters", $.parameter_declarations),
           optional($._semicolon),
         ),
+        // `functag Name Return:public(...)`
         seq(
           "functag",
           field("name", $.identifier),
@@ -707,7 +746,11 @@ module.exports = grammar({
     methodmap_property_alias: ($) =>
       seq(
         $.methodmap_visibility,
-        $.methodmap_property_getter,
+        choice(
+          $.methodmap_property_getter,
+          // Alias setters use empty params: `public set() = Native;`
+          seq(field("name", "set"), "(", ")"),
+        ),
         "=",
         field("function", $.identifier),
         optional($._semicolon),
@@ -745,7 +788,12 @@ module.exports = grammar({
         "struct",
         field("name", $.identifier),
         "{",
-        repeat($.struct_field),
+        // Modern fields start with `public` and use semicolons.
+        // Legacy fields are comma-separated (`const String:name[]`, bare `version`).
+        choice(
+          repeat($.struct_field),
+          seq(commaSep1($.old_struct_field), optional(",")),
+        ),
         "}",
         optional($._semicolon),
       ),
@@ -760,6 +808,14 @@ module.exports = grammar({
         ),
         field("name", $.identifier),
         optional($._semicolon),
+      ),
+
+    old_struct_field: ($) =>
+      seq(
+        optional("const"),
+        field("type", optional($.old_type)),
+        field("name", $.identifier),
+        repeat(choice($.dimension, $.fixed_dimension)),
       ),
 
     struct_declaration: ($) =>
@@ -788,19 +844,41 @@ module.exports = grammar({
 
     old_type: ($) =>
       seq(
-        choice($.old_builtin_type, $.identifier, $.any_type),
+        choice(
+          $.old_builtin_type,
+          $.identifier,
+          $.any_type,
+          $.multi_tag
+        ),
         token.immediate(":"),
       ),
 
     dimension: ($) => seq("[", "]"),
 
-    fixed_dimension: ($) => seq("[", $._expression, "]"),
+    fixed_dimension: ($) =>
+      seq(
+        "[",
+        $._expression,
+        optional(field("packing", $.dimension_packing)),
+        "]",
+      ),
 
-    builtin_type: ($) => choice("void", "bool", "int", "float", "char"),
+    dimension_packing: (_) => "char",
 
-    old_builtin_type: ($) => choice("_", "Float", "bool", "String"),
+    builtin_type: ($) =>
+      choice("void", "bool", "int", "int64", "float", "char"),
+
+    // `void` appears in both styles: new `void Foo()` and old `void:Foo()`.
+    old_builtin_type: ($) => choice("_", "Float", "bool", "String", "void"),
 
     any_type: ($) => "any",
+
+    multi_tag: ($) =>
+      seq(
+        "{",
+        commaSep1(choice($.identifier, $.old_builtin_type)),
+        "}"
+      ),
 
     block: ($) => seq("{", repeat($._statement), "}"),
 
@@ -845,12 +923,24 @@ module.exports = grammar({
       ),
 
     while_statement: ($) =>
-      seq(
-        "while",
-        "(",
-        field("condition", $._expression),
-        ")",
-        field("body", $._statement),
+      choice(
+        // Modern: while (cond) stmt
+        seq(
+          "while",
+          "(",
+          field("condition", $._expression),
+          ")",
+          field("body", $._statement),
+        ),
+        // Legacy Pawn: while !cond do stmt (SourceMod 1.7 and earlier).
+        // Restricted to unary_expression to avoid conflicts with
+        // parenthesized modern while and bare literals.
+        seq(
+          "while",
+          field("condition", $.unary_expression),
+          "do",
+          field("body", $._statement),
+        ),
       ),
 
     do_while_statement: ($) =>
@@ -859,9 +949,11 @@ module.exports = grammar({
           "do",
           field("body", $._statement),
           "while",
-          "(",
-          field("condition", $._expression),
-          ")",
+          // Parens are usual; spcomp also accepts `while !expr`
+          choice(
+            seq("(", field("condition", $._expression), ")"),
+            field("condition", $.unary_expression),
+          ),
           optional($._semicolon),
         ),
       ),
@@ -937,6 +1029,7 @@ module.exports = grammar({
         $.assignment_expression,
         $.call_expression,
         $.array_indexed_access,
+        $.packed_array_indexed_access,
         $.ternary_expression,
         $.field_access,
         $.scope_access,
@@ -975,6 +1068,7 @@ module.exports = grammar({
             "left",
             choice(
               $.array_indexed_access,
+              $.packed_array_indexed_access,
               $.view_as,
               $.field_access,
               $.scope_access,
@@ -1042,6 +1136,19 @@ module.exports = grammar({
         "[",
         field("index", $._expression),
         "]",
+      ),
+
+    // https://forums.alliedmods.net/showthread.php?t=90735
+    packed_array_indexed_access: ($) =>
+      prec(PREC.FIELD,
+        seq(
+          field("array",
+            choice($.identifier, $.array_indexed_access, $.field_access),
+          ),
+          "{",
+          field("index", $._expression),
+          "}",
+        ),
       ),
 
     parenthesized_expression: ($) =>
@@ -1178,6 +1285,7 @@ module.exports = grammar({
         $.float_literal,
         $.char_literal,
         $.string_literal,
+        $.packed_string_literal,
         $.bool_literal,
         $.array_literal,
         $.null,
@@ -1215,7 +1323,7 @@ module.exports = grammar({
       const exponent = seq(/[eE][\+-]?/, digits);
 
       return token(
-          seq(digits, '.', optional(digits), optional(exponent)),
+        seq(digits, '.', optional(digits), optional(exponent)),
       );
     },
 
@@ -1238,11 +1346,16 @@ module.exports = grammar({
         '"',
       ),
 
+    // Packed string
+    // https://forums.alliedmods.net/showthread.php?t=90735
+    packed_string_literal: ($) => prec(PREC.UNARY + 1, seq("!", $.string_literal)),
+
     escape_sequence: ($) =>
       token(
         prec(
           1,
-          seq("\\", /(?:[abefnrt'\"\\]|(?:x[a-zA-Z0-9]{0,2}|\d+);?)/),
+          // `%` is accepted by spcomp (e.g. Format(..., "%.2f\%"))
+          seq("\\", /(?:[abefnrt'\"\\%]|(?:x[a-zA-Z0-9]{0,2}|\d+);?)/),
         ),
       ),
 
